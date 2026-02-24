@@ -2,7 +2,68 @@ import os
 import discord
 from discord import app_commands
 import psycopg
+UPLOAD_CHANNEL = "coach-uploads"
 
+CHANNEL_MAP = {
+    "#weekly": "weekly-video",
+    "#premium": "premium-training",
+    "#elite": "elite-training"
+}
+
+ARCHIVE_CHANNEL = "video-archive"
+
+async def handle_video_distribution(message):
+    if not message.attachments:
+        return
+
+    content = message.content.lower()
+
+    targets = []
+
+    if "#all" in content:
+        targets = list(CHANNEL_MAP.values())
+    else:
+        for tag, channel in CHANNEL_MAP.items():
+            if tag in content:
+                targets.append(channel)
+
+    if not targets:
+        return
+
+    guild = message.guild
+
+    archive = discord.utils.get(guild.text_channels, name=ARCHIVE_CHANNEL)
+
+    for channel_name in targets:
+        channel = discord.utils.get(guild.text_channels, name=channel_name)
+        if not channel:
+            continue
+
+        # Unpin old weekly video if weekly
+        if channel_name == "weekly-video":
+            pins = await channel.pins()
+            for p in pins:
+                await p.unpin()
+                if archive:
+                    await archive.send(f"Archived weekly video:\n{p.content}")
+
+        sent = await channel.send(
+            content=message.content,
+            file=await message.attachments[0].to_file()
+        )
+
+        if channel_name == "weekly-video":
+            await sent.pin()
+
+        await channel.send("📢 New training video dropped!")
+
+@client.event
+async def on_message(message):
+    if message.author.bot:
+        return
+
+    if message.channel.name == UPLOAD_CHANNEL:
+        await handle_video_distribution(message)
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")  # Railway will provide this after you add Postgres
 
