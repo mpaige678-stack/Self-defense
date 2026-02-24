@@ -2,6 +2,20 @@ import os
 import discord
 from discord import app_commands
 import psycopg
+
+DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
+DATABASE_URL = os.getenv("DATABASE_URL")
+
+# ---------- INTENTS ----------
+intents = discord.Intents.default()
+intents.message_content = True
+intents.members = True
+
+# ---------- CLIENT ----------
+client = discord.Client(intents=intents)
+tree = app_commands.CommandTree(client)
+
+# ---------- VIDEO SYSTEM ----------
 UPLOAD_CHANNEL = "coach-uploads"
 
 CHANNEL_MAP = {
@@ -17,7 +31,6 @@ async def handle_video_distribution(message):
         return
 
     content = message.content.lower()
-
     targets = []
 
     if "#all" in content:
@@ -31,7 +44,6 @@ async def handle_video_distribution(message):
         return
 
     guild = message.guild
-
     archive = discord.utils.get(guild.text_channels, name=ARCHIVE_CHANNEL)
 
     for channel_name in targets:
@@ -39,7 +51,6 @@ async def handle_video_distribution(message):
         if not channel:
             continue
 
-        # Unpin old weekly video if weekly
         if channel_name == "weekly-video":
             pins = await channel.pins()
             for p in pins:
@@ -57,28 +68,13 @@ async def handle_video_distribution(message):
 
         await channel.send("📢 New training video dropped!")
 
-@client.event
-async def on_message(message):
-    if message.author.bot:
-        return
-
-    if message.channel.name == UPLOAD_CHANNEL:
-        await handle_video_distribution(message)
-DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
-DATABASE_URL = os.getenv("DATABASE_URL")  # Railway will provide this after you add Postgres
-
-intents = discord.Intents.default() 
-client = discord.Client(intents=intents)
-# If you want prefix commands / reading messages, enable message_content intent:
-# intents.message_content = True
-tree = app_commands.CommandTree(client)
+# ---------- DATABASE ----------
 def db_conn():
     if not DATABASE_URL:
-        raise RuntimeError("DATABASE_URL is not set. Add Postgres on Railway and set DATABASE_URL.")
+        raise RuntimeError("DATABASE_URL is not set.")
     return psycopg.connect(DATABASE_URL)
 
 def init_db():
-    # Creates basic tables for tiers + video submissions
     with db_conn() as conn:
         with conn.cursor() as cur:
             cur.execute("""
@@ -99,77 +95,59 @@ def init_db():
             """)
         conn.commit()
 
+# ---------- EVENTS ----------
 @client.event
 async def on_ready():
-    print(f"✅ Logged in as {client.user} (ID: {client.user.id})")
-    # Initialize DB if available
+    print(f"✅ Logged in as {client.user}")
+
     if DATABASE_URL:
         try:
             init_db()
             print("✅ Database ready")
         except Exception as e:
-            print(f"⚠️ Database init failed: {e}")
+            print("DB error:", e)
 
-    # Sync slash commands
     try:
         synced = await tree.sync()
-        print(f"✅ Synced {len(synced)} command(s)")
+        print(f"✅ Synced {len(synced)} commands")
     except Exception as e:
-        print(f"⚠️ Slash command sync failed: {e}")
+        print("Sync error:", e)
 
-@tree.command(name="ping", description="Test if the bot is online")
+@client.event
+async def on_message(message):
+    if message.author.bot:
+        return
+
+    if message.channel.name == UPLOAD_CHANNEL:
+        await handle_video_distribution(message)
+
+# ---------- COMMANDS ----------
+@tree.command(name="ping", description="Test if bot works")
 async def ping(interaction: discord.Interaction):
     await interaction.response.send_message("pong 🥋", ephemeral=True)
 
-@tree.command(name="set_tier", description="Set a user's tier (free/premium/elite)")
-@app_commands.describe(user="User to update", tier="free, premium, or elite")
+@tree.command(name="set_tier", description="Set a user's tier")
 async def set_tier(interaction: discord.Interaction, user: discord.Member, tier: str):
-    tier = tier.lower().strip()
-    if tier not in {"free", "premium", "elite"}:
-        await interaction.response.send_message("Tier must be: free, premium, or elite.", ephemeral=True)
+
+    if tier not in ["free","premium","elite"]:
+        await interaction.response.send_message("Invalid tier.", ephemeral=True)
         return
 
-    # Simple permission check: only allow server admins
     if not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message("Admins only.", ephemeral=True)
-        return
-
-    if not DATABASE_URL:
-        await interaction.response.send_message("DATABASE_URL not set yet. Add Postgres in Railway.", ephemeral=True)
         return
 
     with db_conn() as conn:
         with conn.cursor() as cur:
             cur.execute("""
                 INSERT INTO users (discord_id, tier)
-                VALUES (%s, %s)
-                ON CONFLICT (discord_id) DO UPDATE SET tier = EXCLUDED.tier;
-            """, (user.id, tier))
+                VALUES (%s,%s)
+                ON CONFLICT (discord_id)
+                DO UPDATE SET tier=EXCLUDED.tier;
+            """,(user.id,tier))
         conn.commit()
 
-    await interaction.response.send_message(f"✅ Set {user.mention} to **{tier}**.", ephemeral=True)
+    await interaction.response.send_message(f"{user.mention} set to {tier}", ephemeral=True)
 
-@tree.command(name="submit_video", description="Submit a training video for review")
-@app_commands.describe(message_url="Paste the Discord message link or video link")
-async def submit_video(interaction: discord.Interaction, message_url: str):
-    if not DATABASE_URL:
-        await interaction.response.send_message("DATABASE_URL not set yet. Add Postgres in Railway.", ephemeral=True)
-        return
-
-    with db_conn() as conn:
-        with conn.cursor() as cur:
-            # Ensure user exists
-            cur.execute("""
-                INSERT INTO users (discord_id) VALUES (%s)
-                ON CONFLICT (discord_id) DO NOTHING;
-            """, (interaction.user.id,))
-            # Insert submission
-            cur.execute("""
-                INSERT INTO video_submissions (discord_id, message_url)
-                VALUES (%s, %s);
-            """, (interaction.user.id, message_url))
-        conn.commit()
-
-    await interaction.response.send_message("✅ Video submitted for review. Coach will respond soon.", ephemeral=True)
-
+# ---------- START BOT ----------
 client.run(DISCORD_TOKEN)
