@@ -67,13 +67,11 @@ async def on_message(message):
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")  # Railway will provide this after you add Postgres
 
-intents = discord.Intents.default()
+intents = discord.Intents.default() 
+client = discord.Client(intents=intents)
 # If you want prefix commands / reading messages, enable message_content intent:
 # intents.message_content = True
-
-client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
-
 def db_conn():
     if not DATABASE_URL:
         raise RuntimeError("DATABASE_URL is not set. Add Postgres on Railway and set DATABASE_URL.")
