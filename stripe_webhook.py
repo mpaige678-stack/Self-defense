@@ -1,14 +1,23 @@
-from fastapi import FastAPI, Request, Header, HTTPException
-import stripe
 import os
+import stripe
+from fastapi import FastAPI, Request, Header, HTTPException
 
 app = FastAPI()
 
+stripe.api_key = os.getenv("STRIPE_SECRET_KEY")
 endpoint_secret = os.getenv("STRIPE_WEBHOOK_SECRET")
 
-@app.post("/stripe/webhook")
-async def stripe_webhook(request: Request, stripe_signature: str = Header(None)):
 
+@app.get("/")
+def home():
+    return {"status": "webhook running"}
+
+
+@app.post("/stripe/webhook")
+async def stripe_webhook(
+    request: Request,
+    stripe_signature: str = Header(None)
+):
     payload = await request.body()
 
     try:
@@ -17,9 +26,10 @@ async def stripe_webhook(request: Request, stripe_signature: str = Header(None))
             stripe_signature,
             endpoint_secret
         )
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+    except stripe.error.SignatureVerificationError:
+        raise HTTPException(status_code=400, detail="Invalid signature")
 
-    print("EVENT TYPE:", event["type"])
+    print("✅ Stripe event received:", event["type"])
 
-    return {"success": True}
+    return {"received": True}
+    
