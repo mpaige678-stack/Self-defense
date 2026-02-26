@@ -1,139 +1,109 @@
 import os
+from datetime import datetime, timedelta, timezone
+
 import stripe
-import aiohttp
+import psycopg
 from fastapi import FastAPI, Request, Header, HTTPException
 
-# ---------------------------
-# FASTAPI APP
-# ---------------------------
 app = FastAPI()
 
-# ---------------------------
-# ENV VARIABLES
-# ---------------------------
 stripe.api_key = os.getenv("STRIPE_SECRET_KEY")
 endpoint_secret = os.getenv("STRIPE_WEBHOOK_SECRET")
-DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
+DATABASE_URL = os.getenv("DATABASE_URL")
 
-# ---------------------------
-# DISCORD CONFIG
-# ---------------------------
-GUILD_ID = 1426996503880138815
-
-ROLE_VERIFIED = 1476479538807439404
-ROLE_RECRUIT = 1426996503880138815
-ROLE_ELITE = 1475724667493810186
-ROLE_FIGHTER = 1476504028576743520
-
-# ---------------------------
-# STRIPE PRICE MAP
-# ---------------------------
+# PRICE_ID -> (tier_name, duration_days)
 PRICE_MAP = {
-    "price_1T50gsB9kGqOyQaKqsChMsDT": "recruit",
-    "price_1T50fgB9kGqOyQaKgkZfH2XZ": "elite",
-    "price_1T50dWB9kGqOyQaKddLCSgbC": "fighter",
+    "price_1T50gsB9kGqOyQaKqsChMsDT": ("recruit", 14),
+    "price_1T50fgB9kGqOyQaKgkZfH2XZ": ("elite", 30),
+    "price_1T50dWB9kGqOyQaKddLCSgbC": ("fighter", 60),
 }
 
-DISCORD_API_BASE = "https://discord.com/api/v10"
+def db_conn():
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL is not set")
+    return psycopg.connect(DATABASE_URL)
 
-# ---------------------------
-# DISCORD ROLE FUNCTIONS
-# ---------------------------
-async def add_role(user_id: int, role_id: int):
-    url = f"{DISCORD_API_BASE}/guilds/{GUILD_ID}/members/{user_id}/roles/{role_id}"
-    headers = {"Authorization": f"Bot {DISCORD_TOKEN}"}
-    async with aiohttp.ClientSession() as session:
-        async with session.put(url, headers=headers) as r:
-            if r.status not in (204, 200):
-                text = await r.text()
-                print("ADD ROLE ERROR:", text)
+def init_db():
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS subscriptions (
+                    discord_id BIGINT PRIMARY KEY,
+                    tier TEXT NOT NULL,
+                    expires_at TIMESTAMPTZ NOT NULL,
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                );
+            """)
+        conn.commit()
 
-async def remove_role(user_id: int, role_id: int):
-    url = f"{DISCORD_API_BASE}/guilds/{GUILD_ID}/members/{user_id}/roles/{role_id}"
-    headers = {"Authorization": f"Bot {DISCORD_TOKEN}"}
-    async with aiohttp.ClientSession() as session:
-        async with session.delete(url, headers=headers) as r:
-            # 404 means user didn't have role (fine)
-            if r.status not in (204, 404, 200):
-                text = await r.text()
-                print("REMOVE ROLE ERROR:", text)
+@app.on_event("startup")
+async def startup():
+    init_db()
+    print("✅ subscriptions table ready")
 
-# ---------------------------
-# HEALTH CHECK
-# ---------------------------
-@app.get("/")
-def home():
-    return {"status": "ok"}
-
-# ---------------------------
-# STRIPE WEBHOOK
-# ---------------------------
 @app.post("/stripe/webhook")
-async def stripe_webhook(
-    request: Request,
-    stripe_signature: str = Header(None, alias="Stripe-Signature"),
-):
-
-    if not endpoint_secret:
-        raise HTTPException(status_code=500, detail="Webhook secret missing")
-
+async def stripe_webhook(request: Request, stripe_signature: str = Header(None)):
     payload = await request.body()
 
     try:
-        event = stripe.Webhook.construct_event(
-            payload,
-            stripe_signature,
-            endpoint_secret
-        )
+        event = stripe.Webhook.construct_event(payload, stripe_signature, endpoint_secret)
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid payload")
     except stripe.error.SignatureVerificationError:
         raise HTTPException(status_code=400, detail="Invalid signature")
 
+    # We only care about successful checkout payments
     if event["type"] != "checkout.session.completed":
-        return {"received": True}
+        return {"ignored": True}
 
     session = event["data"]["object"]
 
-    # Must include this when creating checkout session
-    discord_id = session.get("metadata", {}).get("discord_id")
-
+    # You MUST set metadata={"discord_id": "..."} when creating the Checkout Session
+    discord_id = (session.get("metadata") or {}).get("discord_id")
     if not discord_id:
-        return {"error": "Missing discord_id in metadata"}
+        return {"error": "Missing metadata.discord_id"}
 
-    # Proper way to get purchased price
-    line_items = stripe.checkout.Session.list_line_items(
-        session["id"],
-        limit=1
-    )
-
-    if not line_items.data:
-        return {"error": "No line items found"}
-
-    price_id = line_items.data[0].price.id
+    # Stripe does NOT include line_items unless you expand them.
+    # Easiest: fetch line items here.
+    try:
+        line_items = stripe.checkout.Session.list_line_items(session["id"], limit=1)
+        price_id = line_items["data"][0]["price"]["id"]
+    except Exception as e:
+        return {"error": f"Could not read line_items/price: {e}"}
 
     if price_id not in PRICE_MAP:
-        return {"ignored": True, "price_id": price_id}
+        return {"ignored": True, "reason": "price_id not in PRICE_MAP", "price_id": price_id}
 
-    tier = PRICE_MAP[price_id]
-    user_id = int(discord_id)
+    tier, duration_days = PRICE_MAP[price_id]
 
-    # Always add verified badge
-    await add_role(user_id, ROLE_VERIFIED)
+    now = datetime.now(timezone.utc)
+    add_days = timedelta(days=duration_days)
 
-    # Remove all tier roles first (upgrade safe)
-    await remove_role(user_id, ROLE_RECRUIT)
-    await remove_role(user_id, ROLE_ELITE)
-    await remove_role(user_id, ROLE_FIGHTER)
+    # Renewal logic:
+    # If they still have time left, extend from current expires_at
+    # Otherwise start from now
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT expires_at FROM subscriptions WHERE discord_id=%s;", (int(discord_id),))
+            row = cur.fetchone()
 
-    # Add correct tier
-    if tier == "recruit":
-        await add_role(user_id, ROLE_RECRUIT)
-    elif tier == "elite":
-        await add_role(user_id, ROLE_ELITE)
-    elif tier == "fighter":
-        await add_role(user_id, ROLE_FIGHTER)
+            if row:
+                current_expires = row[0]
+                base = current_expires if current_expires > now else now
+                new_expires = base + add_days
+                cur.execute("""
+                    UPDATE subscriptions
+                    SET tier=%s, expires_at=%s, updated_at=NOW()
+                    WHERE discord_id=%s;
+                """, (tier, new_expires, int(discord_id)))
+            else:
+                new_expires = now + add_days
+                cur.execute("""
+                    INSERT INTO subscriptions (discord_id, tier, expires_at)
+                    VALUES (%s, %s, %s);
+                """, (int(discord_id), tier, new_expires))
 
-    print(f"✅ Assigned {tier} to user {user_id}")
+        conn.commit()
 
-    return {"received": True, "tier": tier}
+    print(f"✅ Saved subscription: discord_id={discord_id} tier={tier} expires={new_expires.isoformat()}")
+    return {"received": True, "tier": tier, "expires_at": new_expires.isoformat()}
