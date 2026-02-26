@@ -1,4 +1,0 @@
-discord.py==2.4.0
-psycopg[binary]>=3.2.2
-python-dotenv==1.0.1
-tzdata==2025.1
