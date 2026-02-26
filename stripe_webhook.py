@@ -2,6 +2,7 @@ import os
 import stripe
 import discord
 from fastapi import FastAPI, Request, Header, HTTPException
+from datetime import datetime, timedelta
 
 app = FastAPI()
 
@@ -9,19 +10,23 @@ stripe.api_key = os.getenv("STRIPE_SECRET_KEY")
 endpoint_secret = os.getenv("STRIPE_WEBHOOK_SECRET")
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
-GUILD_ID = 1426274025583411301
 
-ROLES = {
-    "verified": 1476479538807439404,
-    "recruit": 1426996503880138815,
-    "amateur": 1476336264818196674,
-    "prospect": 1476336193292472431,
-    "contender": 1476336341632422051,
-    "elite": 1475724667493810186,
-    "champion": 1476336417339871422
+GUILD_ID = 1426996503880138815
+
+ROLE_VERIFIED = 1476479538807439404
+ROLE_RECRUIT = 1426996503880138815
+ROLE_ELITE = 1475724667493810186
+ROLE_FIGHTER = 1476504028576743520
+
+PRICE_MAP = {
+    "price_1T50gsB9kGqOyQaKqsChMsDT": ("recruit", 14),
+    "price_1T50fgB9kGqOyQaKgkZfH2XZ": ("elite", 30),
+    "price_1T50dWB9kGqOyQaKddLCSgbC": ("fighter", 60),
 }
 
-client = discord.Client(intents=discord.Intents.all())
+intents = discord.Intents.default()
+intents.members = True
+client = discord.Client(intents=intents)
 
 @app.post("/stripe/webhook")
 async def stripe_webhook(request: Request, stripe_signature: str = Header(None)):
@@ -40,25 +45,38 @@ async def stripe_webhook(request: Request, stripe_signature: str = Header(None))
         session = event["data"]["object"]
 
         discord_id = session["metadata"].get("discord_id")
-        amount = session["amount_total"] / 100
+        price_id = session["line_items"]["data"][0]["price"]["id"]
 
+        if price_id not in PRICE_MAP:
+            return {"ignored": True}
+
+        tier, duration_days = PRICE_MAP[price_id]
+
+        await client.login(DISCORD_TOKEN)
         guild = client.get_guild(GUILD_ID)
         member = guild.get_member(int(discord_id))
 
-        await member.add_roles(guild.get_role(ROLES["verified"]))
+        if not member:
+            return {"error": "Member not found"}
 
-        # assign rank based on payment
-        if amount >= 50:
-            role = "champion"
-        elif amount >= 30:
-            role = "elite"
-        elif amount >= 15:
-            role = "prospect"
-        else:
-            role = "recruit"
+        # Always add Verified badge
+        await member.add_roles(guild.get_role(ROLE_VERIFIED))
 
-        await member.add_roles(guild.get_role(ROLES[role]))
+        # Remove lower roles before upgrading
+        await member.remove_roles(
+            guild.get_role(ROLE_RECRUIT),
+            guild.get_role(ROLE_ELITE),
+            guild.get_role(ROLE_FIGHTER)
+        )
 
-        print("Assigned role:", role, "to", member)
+        # Assign correct tier
+        if tier == "recruit":
+            await member.add_roles(guild.get_role(ROLE_RECRUIT))
+        elif tier == "elite":
+            await member.add_roles(guild.get_role(ROLE_ELITE))
+        elif tier == "fighter":
+            await member.add_roles(guild.get_role(ROLE_FIGHTER))
+
+        print(f"Assigned {tier} to {member}")
 
     return {"received": True}
