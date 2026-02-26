@@ -1,7 +1,6 @@
 import os
 import stripe
-import asyncpg
-import requests
+import discord
 from fastapi import FastAPI, Request, Header, HTTPException
 
 app = FastAPI()
@@ -9,77 +8,57 @@ app = FastAPI()
 stripe.api_key = os.getenv("STRIPE_SECRET_KEY")
 endpoint_secret = os.getenv("STRIPE_WEBHOOK_SECRET")
 
-DATABASE_URL = os.getenv("DATABASE_URL")
-DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
-DISCORD_GUILD_ID = os.getenv("DISCORD_GUILD_ID")
-DISCORD_ROLE_ID = os.getenv("DISCORD_ROLE_ID")
-DISCORD_LOG_WEBHOOK_URL = os.getenv("DISCORD_LOG_WEBHOOK_URL")
+DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
+GUILD_ID = 1426274025583411301
 
-@app.get("/")
-def home():
-    return {"status": "ok"}
+ROLES = {
+    "verified": 1476479538807439404,
+    "recruit": 1426996503880138815,
+    "amateur": 1476336264818196674,
+    "prospect": 1476336193292472431,
+    "contender": 1476336341632422051,
+    "elite": 1475724667493810186,
+    "champion": 1476336417339871422
+}
 
-async def save_purchase(email, session_id):
-    conn = await asyncpg.connect(DATABASE_URL)
-    await conn.execute("""
-        CREATE TABLE IF NOT EXISTS purchases (
-            id SERIAL PRIMARY KEY,
-            email TEXT,
-            session_id TEXT,
-            created_at TIMESTAMP DEFAULT NOW()
-        )
-    """)
-    await conn.execute(
-        "INSERT INTO purchases (email, session_id) VALUES ($1, $2)",
-        email,
-        session_id
-    )
-    await conn.close()
-
-def assign_discord_role(discord_user_id):
-    url = f"https://discord.com/api/v10/guilds/{DISCORD_GUILD_ID}/members/{discord_user_id}/roles/{DISCORD_ROLE_ID}"
-    headers = {
-        "Authorization": f"Bot {DISCORD_BOT_TOKEN}"
-    }
-    requests.put(url, headers=headers)
-
-def send_log_message(message):
-    if DISCORD_LOG_WEBHOOK_URL:
-        requests.post(DISCORD_LOG_WEBHOOK_URL, json={"content": message})
+client = discord.Client(intents=discord.Intents.all())
 
 @app.post("/stripe/webhook")
-async def stripe_webhook(
-    request: Request,
-    stripe_signature: str = Header(None, alias="Stripe-Signature")
-):
+async def stripe_webhook(request: Request, stripe_signature: str = Header(None)):
     payload = await request.body()
 
     try:
         event = stripe.Webhook.construct_event(
-            payload, stripe_signature, endpoint_secret
+            payload,
+            stripe_signature,
+            endpoint_secret
         )
     except Exception:
-        raise HTTPException(status_code=400, detail="Webhook error")
+        raise HTTPException(status_code=400)
 
     if event["type"] == "checkout.session.completed":
         session = event["data"]["object"]
 
-        email = session.get("customer_details", {}).get("email")
-        session_id = session.get("id")
+        discord_id = session["metadata"].get("discord_id")
+        amount = session["amount_total"] / 100
 
-        # Save purchase in DB
-        await save_purchase(email, session_id)
+        guild = client.get_guild(GUILD_ID)
+        member = guild.get_member(int(discord_id))
 
-        # OPTIONAL: assign Discord role if metadata includes discord_user_id
-        discord_user_id = session.get("metadata", {}).get("discord_user_id")
-        if discord_user_id:
-            assign_discord_role(discord_user_id)
+        await member.add_roles(guild.get_role(ROLES["verified"]))
 
-        # Send Discord log
-        send_log_message(
-            f"💰 New Purchase!\nEmail: {email}\nSession: {session_id}"
-        )
+        # assign rank based on payment
+        if amount >= 50:
+            role = "champion"
+        elif amount >= 30:
+            role = "elite"
+        elif amount >= 15:
+            role = "prospect"
+        else:
+            role = "recruit"
 
-        print("✅ Payment fully processed")
+        await member.add_roles(guild.get_role(ROLES[role]))
+
+        print("Assigned role:", role, "to", member)
 
     return {"received": True}
