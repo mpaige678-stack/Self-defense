@@ -2,20 +2,37 @@ import os
 import discord
 from discord import app_commands
 import psycopg
+import stripe
 
+# =========================
+# ENV
+# =========================
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
+STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY")
 
-# ---------- INTENTS ----------
+stripe.api_key = STRIPE_SECRET_KEY
+
+# =========================
+# STRIPE PRICE IDS
+# =========================
+PRICE_RECRUIT = "price_1T50gsB9kGqOyQaKqsChMsDT"
+PRICE_ELITE   = "price_1T50fgB9kGqOyQaKgkZfH2XZ"
+PRICE_FIGHTER = "price_1T50dWB9kGqOyQaKddLCSgbC"
+
+# =========================
+# INTENTS
+# =========================
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
 
-# ---------- CLIENT ----------
 client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
 
-# ---------- VIDEO SYSTEM ----------
+# =========================
+# VIDEO SYSTEM
+# =========================
 UPLOAD_CHANNEL = "coach-uploads"
 
 CHANNEL_MAP = {
@@ -25,6 +42,7 @@ CHANNEL_MAP = {
 }
 
 ARCHIVE_CHANNEL = "video-archive"
+
 
 async def handle_video_distribution(message):
     if not message.attachments:
@@ -68,11 +86,14 @@ async def handle_video_distribution(message):
 
         await channel.send("📢 New training video dropped!")
 
-# ---------- DATABASE ----------
+# =========================
+# DATABASE
+# =========================
 def db_conn():
     if not DATABASE_URL:
-        raise RuntimeError("DATABASE_URL is not set.")
+        raise RuntimeError("DATABASE_URL not set")
     return psycopg.connect(DATABASE_URL)
+
 
 def init_db():
     with db_conn() as conn:
@@ -81,7 +102,7 @@ def init_db():
                 CREATE TABLE IF NOT EXISTS users (
                     discord_id BIGINT PRIMARY KEY,
                     tier TEXT NOT NULL DEFAULT 'free',
-                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    created_at TIMESTAMPTZ DEFAULT NOW()
                 );
             """)
             cur.execute("""
@@ -89,13 +110,15 @@ def init_db():
                     id BIGSERIAL PRIMARY KEY,
                     discord_id BIGINT NOT NULL,
                     message_url TEXT NOT NULL,
-                    status TEXT NOT NULL DEFAULT 'pending',
-                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    status TEXT DEFAULT 'pending',
+                    created_at TIMESTAMPTZ DEFAULT NOW()
                 );
             """)
         conn.commit()
 
-# ---------- EVENTS ----------
+# =========================
+# EVENTS
+# =========================
 @client.event
 async def on_ready():
     print(f"✅ Logged in as {client.user}")
@@ -113,6 +136,7 @@ async def on_ready():
     except Exception as e:
         print("Sync error:", e)
 
+
 @client.event
 async def on_message(message):
     if message.author.bot:
@@ -121,10 +145,13 @@ async def on_message(message):
     if message.channel.name == UPLOAD_CHANNEL:
         await handle_video_distribution(message)
 
-# ---------- COMMANDS ----------
-@tree.command(name="ping", description="Test if bot works")
+# =========================
+# COMMANDS
+# =========================
+@tree.command(name="ping", description="Test bot")
 async def ping(interaction: discord.Interaction):
     await interaction.response.send_message("pong 🥋", ephemeral=True)
+
 
 @tree.command(name="set_tier", description="Set a user's tier")
 async def set_tier(interaction: discord.Interaction, user: discord.Member, tier: str):
@@ -149,5 +176,50 @@ async def set_tier(interaction: discord.Interaction, user: discord.Member, tier:
 
     await interaction.response.send_message(f"{user.mention} set to {tier}", ephemeral=True)
 
-# ---------- START BOT ----------
+# =========================
+# STRIPE BUY COMMAND
+# =========================
+@tree.command(name="buy", description="Buy training access")
+@app_commands.describe(plan="recruit / elite / fighter")
+async def buy(interaction: discord.Interaction, plan: str):
+
+    plan = plan.lower()
+
+    if plan not in ["recruit","elite","fighter"]:
+        await interaction.response.send_message("Choose recruit / elite / fighter", ephemeral=True)
+        return
+
+    price_map = {
+        "recruit": PRICE_RECRUIT,
+        "elite": PRICE_ELITE,
+        "fighter": PRICE_FIGHTER
+    }
+
+    price_id = price_map[plan]
+
+    checkout = stripe.checkout.Session.create(
+        payment_method_types=["card"],
+        line_items=[{
+            "price": price_id,
+            "quantity": 1,
+        }],
+        mode="payment",
+        success_url="https://google.com",
+        cancel_url="https://google.com",
+
+        # ⭐ IMPORTANT PART
+        metadata={
+            "discord_id": str(interaction.user.id),
+            "plan": plan
+        }
+    )
+
+    await interaction.response.send_message(
+        f"💳 Checkout link for **{plan}**:\n{checkout.url}",
+        ephemeral=True
+    )
+
+# =========================
+# START BOT
+# =========================
 client.run(DISCORD_TOKEN)
