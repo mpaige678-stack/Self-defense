@@ -5,3 +5,4 @@ fastapi
 uvicorn[standard]
 asyncpg
 psycopg[binary]
+aiohttp
