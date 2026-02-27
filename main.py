@@ -260,3 +260,4 @@ async def stripe_webhook(request: Request):
         log.exception("Webhook handler failed (non-fatal to Stripe)")
 
     return JSONResponse({"received": True})
+    
