@@ -1,55 +1,7 @@
-# main.py
-"""
-✅ One file that supports BOTH Railway services:
-
-1) Web service (FastAPI)
-   Start command:
-     uvicorn main:app --host 0.0.0.0 --port $PORT
-
-2) Worker service (Discord role giver)
-   Start command:
-     python main.py worker
-
----------------------------------------
-REQUIRED ENV VARS (Web service):
-- STRIPE_SECRET_KEY              (sk_test_... or sk_live_...)
-- STRIPE_WEBHOOK_SECRET          (whsec_...)
-- CHECKOUT_SUCCESS_URL           (ex: https://your-site.com/success OR https://discord.com)
-- CHECKOUT_CANCEL_URL            (ex: https://your-site.com/cancel  OR https://discord.com)
-- DATABASE_URL                   (postgresql://user:pass@host:port/db)
-
-OPTIONAL ENV VARS (Web service):
-- PRICE_ID_CIVILIAN              default uses your IDs below
-- PRICE_ID_FIGHTER
-- PRICE_ID_ELITE
-
----------------------------------------
-REQUIRED ENV VARS (Worker service):
-- DISCORD_TOKEN
-- DISCORD_GUILD_ID               (server/guild ID)
-- DATABASE_URL
-
-REQUIRED ROLE ENV VARS (Worker service):
-- ROLE_ID_CIVILIAN
-- ROLE_ID_FIGHTER
-- ROLE_ID_ELITE
-
-OPTIONAL (Worker service):
-- WORKER_POLL_SECONDS            default 5
-
----------------------------------------
-How it works:
-- Web: /create-checkout-session creates a Stripe Checkout session with metadata (discord_id, tier).
-- Web: /stripe/webhook verifies Stripe signature and writes "paid" rows to Postgres.
-- Worker: polls Postgres for unprocessed paid rows and assigns the right Discord role.
-"""
-
 import os
 import json
-import time
-import asyncio
 import logging
-from typing import Optional, Dict, Any, Tuple
+from typing import Optional, Dict, Any
 
 import stripe
 import psycopg
@@ -58,409 +10,253 @@ from psycopg.rows import dict_row
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
 
-# Discord worker deps
-import discord
-
-# -------------------------
+# -----------------------------
 # Logging
-# -------------------------
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s"
-)
-log = logging.getLogger("genuine-flow")
+# -----------------------------
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("api")
 
+# -----------------------------
+# Required ENV
+# -----------------------------
+STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY")
+STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET")
+DATABASE_URL = os.getenv("DATABASE_URL")
+CHECKOUT_SUCCESS_URL = os.getenv("CHECKOUT_SUCCESS_URL")
+CHECKOUT_CANCEL_URL = os.getenv("CHECKOUT_CANCEL_URL")
 
-# -------------------------
-# Helpers
-# -------------------------
-def env(name: str, default: Optional[str] = None) -> Optional[str]:
-    v = os.getenv(name)
-    return v if v not in (None, "") else default
-
-
-def must_env(name: str) -> str:
-    v = env(name)
+missing = []
+for k, v in [
+    ("STRIPE_SECRET_KEY", STRIPE_SECRET_KEY),
+    ("STRIPE_WEBHOOK_SECRET", STRIPE_WEBHOOK_SECRET),
+    ("DATABASE_URL", DATABASE_URL),
+    ("CHECKOUT_SUCCESS_URL", CHECKOUT_SUCCESS_URL),
+    ("CHECKOUT_CANCEL_URL", CHECKOUT_CANCEL_URL),
+]:
     if not v:
-        raise RuntimeError(f"Missing required env var: {name}")
-    return v
+        missing.append(k)
+if missing:
+    raise RuntimeError(f"Missing required environment variables: {', '.join(missing)}")
 
+stripe.api_key = STRIPE_SECRET_KEY
 
-def get_price_map() -> Dict[str, str]:
-    # Your provided price IDs (defaults)
-    default_civilian = "price_1T5GP1B9kGqOyQaKAHcpccxx"
-    default_fighter  = "price_1T5GRRB9kGqOyQaKN5YoT1LU"
-    default_elite    = "price_1T5GRjB9kGqOyQaKLPQ8gswA"
+# -----------------------------
+# Your tiers / price IDs
+# -----------------------------
+# IMPORTANT: use ONLY the Stripe price id part (no "-civilian" suffix text)
+TIER_CONFIG = {
+    "civilian": {"price_id": "price_1T5GP1B9kGqOyQaKAHcpccxx"},
+    "fighter":  {"price_id": "price_1T5GRRB9kGqOyQaKN5YoT1LU"},
+    "elite":    {"price_id": "price_1T5GRjB9kGqOyQaKLPQ8gswA"},
+}
 
-    return {
-        "civilian": env("PRICE_ID_CIVILIAN", default_civilian),
-        "fighter":  env("PRICE_ID_FIGHTER",  default_fighter),
-        "elite":    env("PRICE_ID_ELITE",    default_elite),
-    }
+def normalize_tier(t: str) -> str:
+    return (t or "").strip().lower()
 
+# -----------------------------
+# DB helpers
+# -----------------------------
+def db_conn():
+    return psycopg.connect(DATABASE_URL, row_factory=dict_row)
 
-def db_conn() -> psycopg.Connection:
-    # Prefer DATABASE_URL (Railway sets this for Postgres)
-    dsn = env("DATABASE_URL")
-    if not dsn:
-        # Some Railway DB templates expose PGHOST, PGUSER, etc.
-        pghost = env("PGHOST")
-        pguser = env("PGUSER")
-        pgpass = env("PGPASSWORD") or env("PGPASS")
-        pgport = env("PGPORT", "5432")
-        pgdb   = env("PGDATABASE")
-        if all([pghost, pguser, pgpass, pgdb]):
-            dsn = f"postgresql://{pguser}:{pgpass}@{pghost}:{pgport}/{pgdb}"
-        else:
-            raise RuntimeError("DATABASE_URL not set (and PG* vars incomplete).")
-
-    # sslmode required for many hosted PGs
-    if "sslmode=" not in dsn:
-        joiner = "&" if "?" in dsn else "?"
-        dsn = dsn + f"{joiner}sslmode=require"
-
-    return psycopg.connect(dsn, row_factory=dict_row)
-
-
-def ensure_tables() -> None:
-    """
-    payments:
-      - one row per successful checkout session
-      - processed=false until worker assigns role
-    """
+def init_db():
     with db_conn() as conn:
         with conn.cursor() as cur:
+            # Users: latest tier state
             cur.execute("""
-                CREATE TABLE IF NOT EXISTS payments (
-                    id BIGSERIAL PRIMARY KEY,
-                    session_id TEXT UNIQUE NOT NULL,
-                    discord_id TEXT NOT NULL,
-                    tier TEXT NOT NULL,
-                    amount_total BIGINT,
-                    currency TEXT,
-                    status TEXT NOT NULL,
-                    processed BOOLEAN NOT NULL DEFAULT FALSE,
-                    processed_at TIMESTAMPTZ,
-                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-                );
+            CREATE TABLE IF NOT EXISTS users (
+                discord_id TEXT PRIMARY KEY,
+                stripe_customer_id TEXT,
+                stripe_subscription_id TEXT,
+                tier TEXT,
+                status TEXT,
+                created_at TIMESTAMPTZ DEFAULT NOW(),
+                updated_at TIMESTAMPTZ DEFAULT NOW()
+            );
             """)
-            conn.commit()
 
+            # Stripe events log (optional but helpful)
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS stripe_events (
+                event_id TEXT PRIMARY KEY,
+                type TEXT,
+                payload JSONB,
+                created_at TIMESTAMPTZ DEFAULT NOW()
+            );
+            """)
 
-def insert_paid_payment(
-    session_id: str,
-    discord_id: str,
-    tier: str,
-    amount_total: Optional[int],
-    currency: Optional[str],
-    status: str
-) -> None:
+            # Job queue for the bot (role updates, announcements, repost jobs if needed)
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS bot_jobs (
+                id BIGSERIAL PRIMARY KEY,
+                job_type TEXT NOT NULL,
+                payload JSONB NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                created_at TIMESTAMPTZ DEFAULT NOW(),
+                processed_at TIMESTAMPTZ
+            );
+            """)
+
+            # Weight logs
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS weight_logs (
+                id BIGSERIAL PRIMARY KEY,
+                discord_id TEXT NOT NULL,
+                weight REAL NOT NULL,
+                unit TEXT NOT NULL DEFAULT 'lb',
+                note TEXT,
+                created_at TIMESTAMPTZ DEFAULT NOW()
+            );
+            """)
+
+        conn.commit()
+
+def enqueue_job(job_type: str, payload: Dict[str, Any]):
     with db_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                """
-                INSERT INTO payments (session_id, discord_id, tier, amount_total, currency, status, processed)
-                VALUES (%s, %s, %s, %s, %s, %s, FALSE)
-                ON CONFLICT (session_id) DO UPDATE
-                SET status = EXCLUDED.status
-                """,
-                (session_id, discord_id, tier, amount_total, currency, status)
+                "INSERT INTO bot_jobs (job_type, payload) VALUES (%s, %s)",
+                (job_type, json.dumps(payload)),
             )
-            conn.commit()
+        conn.commit()
 
-
-def fetch_unprocessed(limit: int = 10) -> list[dict]:
-    with db_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT *
-                FROM payments
-                WHERE processed = FALSE
-                  AND status IN ('paid', 'complete', 'succeeded', 'completed')
-                ORDER BY created_at ASC
-                LIMIT %s
-                """,
-                (limit,)
-            )
-            return cur.fetchall()
-
-
-def mark_processed(payment_id: int) -> None:
-    with db_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                UPDATE payments
-                SET processed = TRUE,
-                    processed_at = NOW()
-                WHERE id = %s
-                """,
-                (payment_id,)
-            )
-            conn.commit()
-
-
-def role_id_for_tier(tier: str) -> Optional[int]:
-    tier = (tier or "").lower().strip()
-    key = {
-        "civilian": "ROLE_ID_CIVILIAN",
-        "fighter":  "ROLE_ID_FIGHTER",
-        "elite":    "ROLE_ID_ELITE",
-    }.get(tier)
-
-    if not key:
-        return None
-    v = env(key)
-    return int(v) if v and v.isdigit() else None
-
-
-# -------------------------
-# FastAPI (Web Service)
-# -------------------------
-app = FastAPI(title="Genuine Flow", version="0.1.0")
-
+# -----------------------------
+# FastAPI App
+# -----------------------------
+app = FastAPI(title="Stripe + Discord Membership API", version="1.0.0")
 
 @app.on_event("startup")
-async def startup_event():
-    # Never crash on import/startup for missing envs — just warn.
-    try:
-        ensure_tables()
-        log.info("DB tables ensured ✅")
-    except Exception as e:
-        log.exception(f"DB init failed: {e}")
-
-    sk = env("STRIPE_SECRET_KEY")
-    if sk:
-        stripe.api_key = sk
-        log.info("Stripe secret key loaded ✅")
-    else:
-        log.warning("STRIPE_SECRET_KEY not set (checkout creation will fail until you add it).")
-
-
-@app.get("/")
-async def root():
-    return {"ok": True, "service": "genuine-flow", "hint": "Open /docs for endpoints"}
-
+def on_startup():
+    init_db()
+    log.info("DB initialized.")
 
 @app.get("/health")
-async def health():
-    # lightweight DB ping
-    try:
-        with db_conn() as conn:
-            with conn.cursor() as cur:
-                cur.execute("SELECT 1;")
-                _ = cur.fetchone()
-        return {"ok": True, "db": True}
-    except Exception as e:
-        return {"ok": False, "db": False, "error": str(e)}
+def health():
+    return {"ok": True}
 
+@app.get("/pricing")
+def pricing():
+    return {
+        "tiers": {
+            k: {"price_id": v["price_id"]} for k, v in TIER_CONFIG.items()
+        }
+    }
 
+# -----------------------------
+# Create Checkout Session
+# -----------------------------
+# Example:
+# /create-checkout-session?discord_id=123456789&tier=civilian
 @app.get("/create-checkout-session")
-async def create_checkout_session(discord_id: str, tier: str):
-    """
-    Call like:
-      /create-checkout-session?discord_id=123456789&tier=elite
+def create_checkout_session(discord_id: str, tier: str):
+    tier = normalize_tier(tier)
+    if tier not in TIER_CONFIG:
+        raise HTTPException(status_code=400, detail=f"Invalid tier. Use one of: {list(TIER_CONFIG.keys())}")
 
-    Returns JSON:
-      {"url": "https://checkout.stripe.com/..."}
-    """
-    if not env("STRIPE_SECRET_KEY"):
-        raise HTTPException(status_code=500, detail="STRIPE_SECRET_KEY is missing")
-    stripe.api_key = must_env("STRIPE_SECRET_KEY")
+    if not discord_id or not discord_id.isdigit():
+        raise HTTPException(status_code=400, detail="discord_id must be numeric (copy user ID from Discord Developer Mode).")
 
-    price_map = get_price_map()
-    tier_norm = (tier or "").lower().strip()
-
-    if tier_norm not in price_map:
-        raise HTTPException(status_code=400, detail=f"Invalid tier. Use one of: {list(price_map.keys())}")
-
-    success_url = env("CHECKOUT_SUCCESS_URL")
-    cancel_url = env("CHECKOUT_CANCEL_URL")
-    if not success_url or not cancel_url:
-        raise HTTPException(status_code=500, detail="CHECKOUT_SUCCESS_URL or CHECKOUT_CANCEL_URL missing")
+    price_id = TIER_CONFIG[tier]["price_id"]
 
     try:
         session = stripe.checkout.Session.create(
-            payment_method_types=["card"],
-            line_items=[{"price": price_map[tier_norm], "quantity": 1}],
-            mode="payment",
-            success_url=success_url,
-            cancel_url=cancel_url,
+            mode="subscription",
+            line_items=[{"price": price_id, "quantity": 1}],
+            success_url=f"{CHECKOUT_SUCCESS_URL}?session_id={{CHECKOUT_SESSION_ID}}",
+            cancel_url=CHECKOUT_CANCEL_URL,
             metadata={
-                "discord_id": str(discord_id),
-                "tier": tier_norm,
+                "discord_id": discord_id,
+                "tier": tier,
             },
         )
         return {"url": session.url}
     except Exception as e:
-        log.exception(f"Stripe checkout create failed: {e}")
+        log.exception("Failed creating checkout session")
         raise HTTPException(status_code=500, detail=str(e))
 
-
+# -----------------------------
+# Stripe Webhook
+# -----------------------------
 @app.post("/stripe/webhook")
 async def stripe_webhook(request: Request):
-    """
-    Stripe sends events here.
-    We verify signature, then on checkout.session.completed we write a row to DB.
-    Worker later assigns the role.
-    """
     payload = await request.body()
-    sig_header = request.headers.get("stripe-signature")
-    whsec = env("STRIPE_WEBHOOK_SECRET")
-
-    if not whsec:
-        raise HTTPException(status_code=500, detail="STRIPE_WEBHOOK_SECRET missing")
-    if not sig_header:
-        raise HTTPException(status_code=400, detail="Missing stripe-signature header")
+    sig = request.headers.get("stripe-signature", "")
 
     try:
-        event = stripe.Webhook.construct_event(
-            payload=payload,
-            sig_header=sig_header,
-            secret=whsec,
-        )
+        event = stripe.Webhook.construct_event(payload, sig, STRIPE_WEBHOOK_SECRET)
     except Exception as e:
-        log.warning(f"Webhook signature verification failed: {e}")
-        raise HTTPException(status_code=400, detail="Invalid signature")
+        raise HTTPException(status_code=400, detail=f"Webhook error: {str(e)}")
 
+    event_id = event.get("id")
     event_type = event.get("type")
-    data_object = (event.get("data") or {}).get("object") or {}
 
-    # Handle the event
-    if event_type == "checkout.session.completed":
-        # session object
-        session_id = data_object.get("id")
-        payment_status = data_object.get("payment_status") or "completed"
-        amount_total = data_object.get("amount_total")
-        currency = data_object.get("currency")
-        metadata = data_object.get("metadata") or {}
-        discord_id = metadata.get("discord_id")
-        tier = metadata.get("tier")
+    # Save event (optional)
+    try:
+        with db_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO stripe_events (event_id, type, payload) VALUES (%s, %s, %s) ON CONFLICT (event_id) DO NOTHING",
+                    (event_id, event_type, json.dumps(event)),
+                )
+            conn.commit()
+    except Exception:
+        log.exception("Failed saving stripe event (non-fatal)")
 
-        if not session_id or not discord_id or not tier:
-            log.warning(f"checkout.session.completed missing metadata/session_id: {session_id}, {metadata}")
-            return JSONResponse({"received": True, "ignored": True})
+    # Handle events
+    try:
+        if event_type == "checkout.session.completed":
+            session = event["data"]["object"]
+            discord_id = (session.get("metadata") or {}).get("discord_id")
+            tier = (session.get("metadata") or {}).get("tier")
+            customer_id = session.get("customer")
+            subscription_id = session.get("subscription")
 
-        # Stripe uses payment_status="paid" for paid sessions
-        status = "paid" if str(payment_status).lower() == "paid" else str(payment_status).lower()
+            if discord_id and tier:
+                with db_conn() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute("""
+                            INSERT INTO users (discord_id, stripe_customer_id, stripe_subscription_id, tier, status, updated_at)
+                            VALUES (%s, %s, %s, %s, %s, NOW())
+                            ON CONFLICT (discord_id) DO UPDATE SET
+                                stripe_customer_id = EXCLUDED.stripe_customer_id,
+                                stripe_subscription_id = EXCLUDED.stripe_subscription_id,
+                                tier = EXCLUDED.tier,
+                                status = EXCLUDED.status,
+                                updated_at = NOW();
+                        """, (discord_id, customer_id, subscription_id, tier, "active"))
+                    conn.commit()
 
-        try:
-            insert_paid_payment(
-                session_id=session_id,
-                discord_id=str(discord_id),
-                tier=str(tier).lower().strip(),
-                amount_total=amount_total,
-                currency=currency,
-                status=status
-            )
-            log.info(f"Saved payment ✅ session={session_id} discord={discord_id} tier={tier} status={status}")
-        except Exception as e:
-            log.exception(f"DB insert failed: {e}")
-            raise HTTPException(status_code=500, detail="DB insert failed")
+                # Tell the bot to assign role
+                enqueue_job("assign_role", {"discord_id": discord_id, "tier": tier})
+                log.info(f"Enqueued role assignment: {discord_id} -> {tier}")
 
-    # You can add more event types if you want:
-    # elif event_type == "payment_intent.succeeded": ...
+        elif event_type in ("customer.subscription.deleted", "customer.subscription.updated"):
+            sub = event["data"]["object"]
+            subscription_id = sub.get("id")
+            status = sub.get("status")  # canceled, active, past_due, etc.
+
+            # Find user by subscription_id
+            with db_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT discord_id, tier FROM users WHERE stripe_subscription_id = %s", (subscription_id,))
+                    row = cur.fetchone()
+                conn.commit()
+
+            if row:
+                discord_id = row["discord_id"]
+                tier = row["tier"]
+
+                # Update status
+                with db_conn() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute("UPDATE users SET status=%s, updated_at=NOW() WHERE discord_id=%s", (status, discord_id))
+                    conn.commit()
+
+                # Tell bot to refresh roles (remove if canceled/unpaid)
+                enqueue_job("sync_roles", {"discord_id": discord_id})
+                log.info(f"Enqueued role sync: {discord_id} (status={status})")
+
+    except Exception:
+        log.exception("Webhook handler failed (non-fatal to Stripe)")
 
     return JSONResponse({"received": True})
-
-
-# -------------------------
-# Discord Worker
-# -------------------------
-class RoleWorker(discord.Client):
-    def __init__(self):
-        intents = discord.Intents.none()
-        intents.guilds = True
-        intents.members = True  # needed to fetch members / assign roles
-        super().__init__(intents=intents)
-
-        self.guild_id = int(must_env("DISCORD_GUILD_ID"))
-        self.poll_seconds = int(env("WORKER_POLL_SECONDS", "5"))
-
-    async def on_ready(self):
-        log.info(f"Worker logged in as {self.user} ✅")
-        await self.worker_loop()
-
-    async def worker_loop(self):
-        while True:
-            try:
-                # fetch some unprocessed payments
-                rows = fetch_unprocessed(limit=10)
-                if rows:
-                    log.info(f"Worker found {len(rows)} unprocessed payments...")
-                for row in rows:
-                    await self.process_row(row)
-            except Exception as e:
-                log.exception(f"Worker loop error: {e}")
-
-            await asyncio.sleep(self.poll_seconds)
-
-    async def process_row(self, row: Dict[str, Any]):
-        payment_id = row["id"]
-        discord_id = int(row["discord_id"])
-        tier = row["tier"]
-
-        role_id = role_id_for_tier(tier)
-        if not role_id:
-            log.warning(f"No role mapping for tier={tier}. Marking processed to avoid loop.")
-            mark_processed(payment_id)
-            return
-
-        guild = self.get_guild(self.guild_id)
-        if guild is None:
-            try:
-                guild = await self.fetch_guild(self.guild_id)
-            except Exception as e:
-                log.warning(f"Cannot access guild {self.guild_id}: {e}")
-                return
-
-        # get member
-        member = guild.get_member(discord_id)
-        if member is None:
-            try:
-                member = await guild.fetch_member(discord_id)
-            except Exception as e:
-                log.warning(f"Cannot fetch member {discord_id}: {e}")
-                return
-
-        role = guild.get_role(role_id)
-        if role is None:
-            log.warning(f"Role id {role_id} not found in guild. Check ROLE_ID_* env vars.")
-            return
-
-        try:
-            if role in member.roles:
-                log.info(f"Member {discord_id} already has role {tier}. Marking processed.")
-                mark_processed(payment_id)
-                return
-
-            await member.add_roles(role, reason="Stripe payment confirmed")
-            log.info(f"✅ Assigned role {tier} to member {discord_id}")
-            mark_processed(payment_id)
-
-        except Exception as e:
-            log.warning(f"Failed to add role: {e}")
-            # Don't mark processed so it can retry later.
-
-
-def run_worker():
-    token = must_env("DISCORD_TOKEN")
-    # Ensure DB schema exists
-    ensure_tables()
-    client = RoleWorker()
-    client.run(token)
-
-
-# -------------------------
-# Entrypoint (Worker mode)
-# -------------------------
-if __name__ == "__main__":
-    # Run worker with: python main.py worker
-    # (Web runs with uvicorn main:app ...)
-    if len(os.sys.argv) >= 2 and os.sys.argv[1].lower() == "worker":
-        run_worker()
-    else:
-        print("This file is meant to be run as:")
-        print("  Web:    uvicorn main:app --host 0.0.0.0 --port $PORT")
-        print("  Worker: python main.py worker")
