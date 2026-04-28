@@ -22,8 +22,8 @@ log = logging.getLogger("fitness-app")
 
 # -----------------------------
 # ENV
-PREMIUM_PRICE_ID=prod_UCbPwZmNzv5j1h
-ELITE_PRICE_ID=prod_UCbPv7lrdgppN3
+PREMIUM_PRICE_ID=require_env(price_1TECCGB9kGqOyQaK2mqIer56)
+ELITE_PRICE_ID=require_env(price_1TECCXB9kGqOyQaKLHMRa4ZY)
 # -----------------------------
 def require_env(name: str) -> str:
     value = os.getenv(name)
